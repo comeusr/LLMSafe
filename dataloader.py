@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from utils import rank0_print, on_rank0, delete_dict
 import pandas as pd
 import numpy as np
-
+import json
 
 @dataclass
 class Example:
@@ -123,6 +123,40 @@ def get_alpacaeval(split: str, human_prefix: str, human_suffix: str, assistant_p
 
     return data
 
+def get_kl(dataset_path: str) -> Dataset:
+    """
+    Load the customized KL dataset and convert it into to a Dataset.
+
+    We first create a LLM safety allignment dataset based on the csHuang/SafeAligner and LLM-LAT/benign-dataset.
+    We then load the dataset from a json file, and convert it into a Dataset. 
+    """
+    data = Dataset('kl')
+    with open(dataset_path, 'r') as f:
+        dataset = json.load(f)
+    
+    if on_rank0():
+        dataset = tqdm.tqdm(dataset, desc='Processing KL')
+
+    for row in dataset:
+        prompt = row['prompt']
+
+        if int(row['safety']):
+            aligned_list = row['acc_responses']
+            unaligned_list = row['rej_responses']
+        else:
+            aligned_list = row['rej_responses']
+            unaligned_list = row['acc_responses']
+
+        aligned_split = min(len(aligned_list),len(unaligned_list))
+        response = aligned_list[:aligned_split] + unaligned_list[:aligned_split]
+
+        data[prompt].prompt = prompt
+        data[prompt].generations.extend(response)
+        for i in range(aligned_split):
+            data[prompt].pairs.append((i, i+aligned_split))
+        data[prompt].dataset_name = 'kl'
+
+    return data
 
 def get_shp(split: str, human_prefix: str, human_suffix: str, assistant_prefix: str, assistant_suffix: str) -> Dataset:
     """
@@ -407,6 +441,7 @@ class DataLoader:
                  assistant_prefix: str = '\n<|assistant|>\n',   # marks start of assistant's turn
                  assistant_suffix: str = '',                    # marks end of assistant's turn
                  seed:int = 0,
+                 dataset_path: str = None,
                  **kwargs):
         
         torch.manual_seed(seed)
@@ -428,7 +463,10 @@ class DataLoader:
         self.full_data = {}
 
         for name in dataset_names:
-            dataset = globals()[f"get_{name}"](split, human_prefix, human_suffix, assistant_prefix, assistant_suffix)
+            if name == 'kl':
+                dataset = get_kl(dataset_path)
+            else:
+                dataset = globals()[f"get_{name}"](split, human_prefix, human_suffix, assistant_prefix, assistant_suffix)
             self.full_data.update(dataset.data)
 
     def collate(self, batch: Dict[str, List]) -> Dict:

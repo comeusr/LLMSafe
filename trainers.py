@@ -1407,3 +1407,28 @@ class PPOTrainer(BasicTrainer):
                 scheduler_state_dict = self.scheduler.state_dict()
                 self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
                 del scheduler_state_dict
+
+
+class KLTrainer(BasicTrainer):
+
+    def forward(self, model, batch, is_policy=True):
+        """Run the given model on the given batch of inputs.
+        
+        Args:
+            model: The model to run
+            batch: Dictionary of input tensors
+            is_policy: Whether this is the policy model (vs reference model)
+            
+        Returns:
+            logits: Model output logits
+            logps: Log probabilities
+        """
+        logits = model(batch['target_combined_input_ids'], 
+                      attention_mask=batch['target_combined_attention_mask'],
+                      use_cache=(not self.is_mistral)).logits.to(self.policy_dtype)
+        
+        logps = get_batch_logps(logits, batch['target_labels'], average_log_prob=False)
+        
+        return logits, logps
+
+
