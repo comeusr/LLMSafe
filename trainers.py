@@ -1409,26 +1409,39 @@ class PPOTrainer(BasicTrainer):
                 del scheduler_state_dict
 
 
-class KLTrainer(BasicTrainer):
+class KLTrainer(UnpairedPreferenceTrainer):
 
-    def forward(self, model, batch, is_policy=True):
-        """Run the given model on the given batch of inputs.
+    def __init__(self, 
+                 tokenizer: AutoTokenizer, 
+                 config: DictConfig, 
+                 train_iterator: dataloader.DataLoader, 
+                 eval_iterator: dataloader.DataLoader, 
+                 policy: nn.Module, 
+                 reference_model: Optional[nn.Module] = None, 
+                 rank: int = 0, 
+                 world_size: int = 1, 
+                 fsdp: bool = False,
+                 ):
         
-        Args:
-            model: The model to run
-            batch: Dictionary of input tensors
-            is_policy: Whether this is the policy model (vs reference model)
-            
-        Returns:
-            logits: Model output logits
-            logps: Log probabilities
-        """
-        logits = model(batch['target_combined_input_ids'], 
-                      attention_mask=batch['target_combined_attention_mask'],
-                      use_cache=(not self.is_mistral)).logits.to(self.policy_dtype)
-        
-        logps = get_batch_logps(logits, batch['target_labels'], average_log_prob=False)
-        
-        return logits, logps
+        super().__init__(tokenizer, config, train_iterator, eval_iterator, policy, reference_model, rank, world_size, fsdp)
+        self.moving_avg_track = 1
+        self.moving_avg_rate = config.loss.moving_avg_rate
 
+    def loss(self,
+             policy_chosen_logps: torch.FloatTensor,
+             policy_rejected_logps: torch.FloatTensor,
+             reference_chosen_logps: torch.FloatTensor,
+             reference_rejected_logps: torch.FloatTensor) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
 
+        chosen_logratios = (policy_chosen_logps - reference_chosen_logps)
+        rejected_logratios = (policy_rejected_logps-reference_rejected_logps)
+
+        rejected_ratios_power = torch.pow(torch.exp(rejected_logratios), self.config.loss.beta)
+        self.moving_avg_track = (1-self.moving_avg_rate)*self.moving_avg_track+self.moving_avg_rate*rejected_ratios_power.mean().detach()
+        
+        losses = torch.cat(-self.config.loss.beta*chosen_logratios, 1/self.moving_avg_track*rejected_ratios_power)
+        
+        chosen_rewards = self.config.loss.beta*chosen_logratios.detach()
+        rejected_rewards = 1/self.moving_avg_track*rejected_ratios_power.detach()
+
+        return losses, chosen_rewards, rejected_rewards
