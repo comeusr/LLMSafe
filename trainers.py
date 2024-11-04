@@ -1436,12 +1436,12 @@ class KLTrainer(UnpairedPreferenceTrainer):
         chosen_logratios = (policy_chosen_logps - reference_chosen_logps)
         rejected_logratios = (policy_rejected_logps-reference_rejected_logps)
 
-        rejected_ratios_power = torch.pow(torch.exp(rejected_logratios), self.config.loss.beta)
+        rejected_ratios_power = torch.exp(self.config.loss.beta*rejected_logratios) #torch.pow(torch.exp(rejected_logratios), self.config.loss.beta)
         self.moving_avg_track = (1-self.moving_avg_rate)*self.moving_avg_track+self.moving_avg_rate*rejected_ratios_power.mean().detach()
         
         losses = torch.cat(-self.config.loss.beta*chosen_logratios, 1/self.moving_avg_track*rejected_ratios_power)
         
         chosen_rewards = self.config.loss.beta*chosen_logratios.detach()
-        rejected_rewards = 1/self.moving_avg_track*rejected_ratios_power.detach()
+        rejected_rewards = self.config.loss.beta*rejected_logratios.detach() #1/self.moving_avg_track*rejected_ratios_power.detach()
 
         return losses, chosen_rewards, rejected_rewards
