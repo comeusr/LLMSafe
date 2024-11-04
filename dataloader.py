@@ -123,22 +123,22 @@ def get_alpacaeval(split: str, human_prefix: str, human_suffix: str, assistant_p
 
     return data
 
-def get_kl(dataset_path: str) -> Dataset:
+def get_kl(split: str, human_prefix: str, human_suffix: str, assistant_prefix: str, assistant_suffix: str) -> Dataset:
     """
     Load the customized KL dataset and convert it into to a Dataset.
 
     We first create a LLM safety allignment dataset based on the csHuang/SafeAligner and LLM-LAT/benign-dataset.
     We then load the dataset from a json file, and convert it into a Dataset. 
     """
-    data = Dataset('kl')
-    with open(dataset_path, 'r') as f:
-        dataset = json.load(f)
-    
+    rank0_print(f'Loading KL dataset from Huggingface...')
+    dataset = datasets.load_dataset('rhaldar97/Safety_Accept_Reject', split=split)
     if on_rank0():
         dataset = tqdm.tqdm(dataset, desc='Processing KL')
+    
+    data = Dataset('kl')
 
     for row in dataset:
-        prompt = row['prompt']
+        prompt = human_prefix+row['prompt']+human_suffix+assistant_prefix
 
         if int(row['safety']):
             aligned_list = row['acc_responses']
@@ -147,11 +147,12 @@ def get_kl(dataset_path: str) -> Dataset:
             aligned_list = row['rej_responses']
             unaligned_list = row['acc_responses']
 
-        aligned_split = min(len(aligned_list),len(unaligned_list))
+        aligned_split = min(len(aligned_list), len(unaligned_list))
         response = aligned_list[:aligned_split] + unaligned_list[:aligned_split]
 
         data[prompt].prompt = prompt
-        data[prompt].generations.extend(response)
+        for response in response:
+            data[prompt].generations.append(response+assistant_suffix)
         for i in range(aligned_split):
             data[prompt].pairs.append((i, i+aligned_split))
         data[prompt].dataset_name = 'kl'
@@ -463,10 +464,7 @@ class DataLoader:
         self.full_data = {}
 
         for name in dataset_names:
-            if name == 'kl':
-                dataset = get_kl(dataset_path)
-            else:
-                dataset = globals()[f"get_{name}"](split, human_prefix, human_suffix, assistant_prefix, assistant_suffix)
+            dataset = globals()[f"get_{name}"](split, human_prefix, human_suffix, assistant_prefix, assistant_suffix)
             self.full_data.update(dataset.data)
 
     def collate(self, batch: Dict[str, List]) -> Dict:
