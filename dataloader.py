@@ -127,11 +127,20 @@ def get_kl(split: str, human_prefix: str, human_suffix: str, assistant_prefix: s
     """
     Load the customized KL dataset and convert it into to a Dataset.
 
-    We first create a LLM safety allignment dataset based on the csHuang/SafeAligner and LLM-LAT/benign-dataset.
+    We first create a LLM safety allignment dataset based on the csHuang/SafeAligner and llm-wizard/alpaca-gpt4-data.
     We then load the dataset from a json file, and convert it into a Dataset. 
     """
     rank0_print(f'Loading KL dataset from Huggingface...')
-    dataset = datasets.load_dataset('rhaldar97/Safety_Accept_Reject', split=split)
+    dataset = datasets.load_dataset('rhaldar97/Safety_Accept_Reject', split='train')
+
+    # Split the dataset into train and test 
+    dataset_split = dataset.train_test_split(test_size=0.1, seed=42) 
+    # Access the train and test splits 
+    if split == 'train':
+        dataset = dataset_split['train'] 
+    else:
+        dataset = dataset_split['test']
+     
     if on_rank0():
         dataset = tqdm.tqdm(dataset, desc='Processing KL')
     
