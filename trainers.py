@@ -1449,3 +1449,127 @@ class KLTrainer(UnpairedPreferenceTrainer):
         rejected_rewards = self.config.loss.beta*rejected_logratios.detach() #1/self.moving_avg_track*rejected_ratios_power.detach()
 
         return losses, chosen_rewards, rejected_rewards
+    
+    def reset_moving_avg(self):
+        self.moving_avg_track = 1
+
+    def train(self):
+        """Begin either SFT or HALO training, with periodic evaluation. This is subclassed when implementing PPO."""
+
+        rank0_print(f'Using {self.config.optimizer} optimizer with learning rate {self.config.lr}')
+        self.optimizer = getattr(torch.optim, self.config.optimizer)(self.policy.parameters(), lr=self.config.lr)
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda step: min(1.0, (step + 1) / (self.config.warmup_steps + 1)))
+
+        if self.reference_model is not None:
+            self.reference_model.eval()
+
+        for epoch in range(10):
+            print(f'====== Running epoch {epoch} =========')
+            last_log = None
+            gradients_accumulated = 0
+            batch_metrics = defaultdict(list)
+            rank0_print(f"Resetting moving average to 1")
+            self.reset_moving_avg()
+            
+            for batch in self.train_iterator:
+                # EVALUATION
+                if self.example_counter % self.config.eval_every == 0 and (self.example_counter > 0 or self.config.do_first_eval):
+                    rank0_print(f'Running evaluation after {self.example_counter} train examples')
+                    self.policy.eval()
+
+                    all_eval_metrics = defaultdict(list)
+                
+                    for eval_batch in (tqdm.tqdm(self.eval_batches, desc='Computing eval metrics') if self.rank == 0 else self.eval_batches):
+                        local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+                        with torch.no_grad():
+                            _, eval_metrics = self.get_batch_metrics(local_eval_batch, mode='eval')
+
+                        for k, v in eval_metrics.items():
+                            all_eval_metrics[k].extend(v)
+
+                        delete_dict(local_eval_batch)
+
+                    mean_eval_metrics = {}
+                    for k, v in all_eval_metrics.items():
+                        if len(v) > 0:
+                            mean_eval_metrics[k] = sum(v) / len(v)
+                    rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
+                
+                    if self.config.wandb.enabled and self.rank == 0:
+                        wandb.log(mean_eval_metrics, step=self.example_counter)
+
+                    if self.example_counter > 0:
+                        if self.config.debug:
+                            rank0_print('skipping save in debug mode')
+                        elif self.config.intermediate_checkpoints:
+                            output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
+                            rank0_print(f'creating checkpoint to write to {output_dir}...')
+                            self.save(output_dir, mean_eval_metrics)
+
+                    delete_dict(all_eval_metrics)
+                    delete_dict(mean_eval_metrics)
+
+                #### TRAINING
+                self.policy.train()
+
+                start_time = time.time()
+                
+                local_microbatch = slice_and_move_batch_for_device(batch, self.rank, self.world_size, self.rank)
+                loss, metrics = self.get_batch_metrics(local_microbatch)
+                (loss / self.config.model.gradient_accumulation_steps).backward()
+
+                for k, v in metrics.items():
+                    batch_metrics[k].extend(v)
+
+                gradients_accumulated += 1
+                
+                if gradients_accumulated == self.config.model.gradient_accumulation_steps:
+                    grad_norm = self.clip_gradient()
+                    batch_metrics['grad_norm'].append(grad_norm)
+
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    self.scheduler.step()
+                    gradients_accumulated = 0
+
+                step_time = time.time() - start_time
+                examples_per_second = self.config.model.batch_size / step_time
+                batch_metrics['examples_per_second'].append(examples_per_second)
+                
+                self.batch_counter += 1
+                self.example_counter += self.config.model.batch_size
+
+                delete_dict(local_microbatch)
+                delete_dict(metrics)
+
+                if gradients_accumulated == 0 and (last_log is None or time.time() - last_log > self.config.minimum_log_interval_secs):
+                    mean_train_metrics = {}
+                    for k, v in batch_metrics.items():
+                        if len(v) > 0:
+                            mean_train_metrics[k] = sum(v) / len(v)
+
+                    mean_train_metrics['counters/examples'] = self.example_counter
+                    mean_train_metrics['counters/updates'] = self.batch_counter
+                    rank0_print(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')
+
+                    if self.config.wandb.enabled and self.rank == 0:
+                        wandb.log(mean_train_metrics, step=self.example_counter)
+
+                    last_log = time.time()
+
+                    delete_dict(batch_metrics)
+                    delete_dict(mean_train_metrics)
+                    delete_dict(batch)
+                    batch_metrics = defaultdict(list)
+
+                    # explicitly empty cache if less than 100MB available
+                    r = torch.cuda.memory_reserved(self.rank)
+                    a = torch.cuda.memory_allocated(self.rank)
+
+                    if (r - a) / 1024 < 100:
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                else:
+                    rank0_print(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
+
+    
